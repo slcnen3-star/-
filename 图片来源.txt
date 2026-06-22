@@ -1,0 +1,31 @@
+图片来源说明
+
+本项目图片用于课程设计仿真测试，主要用于演示 HSV 色彩分割、地形分类、障碍物候选检测与可通行区域高亮效果。
+
+森林场景：
+1. forest_01.jpg
+   作者：Cody Waters
+   页面：https://unsplash.com/photos/F3EIEHxy5Jc
+
+2. forest_02.jpg
+   作者：Peter Robbins
+   页面：https://unsplash.com/photos/_0QWCZdgYPg
+
+砂石路面/林道场景：
+1. gravel_01.jpg
+   作者：Wolfgang Hasselmann
+   页面：https://unsplash.com/photos/wyMfyfTSsB8
+
+2. gravel_02.jpg
+   作者：Peter Robbins
+   页面：https://unsplash.com/photos/pMZyzPiGmGA
+
+草地/杂草场景：
+1. grassland_01.jpg
+   页面：https://morotur.no/tur/mauren-fraa-noervasundet
+
+2. grassland_02.jpg
+   页面：https://colver.fr/tonte-raisonnee/
+
+说明：
+这些图片仅作为课程设计中的场景样本使用。若上传公开仓库，请保留本文件中的来源链接。

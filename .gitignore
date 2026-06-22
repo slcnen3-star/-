@@ -1,0 +1,20 @@
+# Python virtual environment and cache
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE files
+.idea/
+.vscode/
+
+# Generated outputs
+results/
+
+# Temporary or unused candidate images
+candidate_images/
+data_selected/
+
+# OS files
+.DS_Store
+Thumbs.db
