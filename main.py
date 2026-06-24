@@ -189,10 +189,24 @@ def build_masks(bgr, hsv, gray, category):
 
     # near_ground_roi 是“近处地面约束”。
     # 前面的 roi 用来做颜色/纹理分析，范围可以稍大；但最终标成绿色的可通行区域，
-    # 应该更偏向画面下方，因为远处山体、远处树林虽然颜色相似，却不是机器人当前能走到的区域。
+    # 应该更偏向画面下方和画面中心，因为摄像头视角下道路通常从下方往中心远处延伸。
+    # 这里不用简单的水平切线，而是做成透视梯形：下方范围宽，上方范围窄。
+    # 这样可以保留画面中间较远处的真实道路，同时减少两侧树林、远山被误判为可通行区域。
     near_ground_roi = np.zeros((h, w), dtype=np.uint8)
-    near_start_ratio = 0.36 if category == "grassland" else 0.45
-    near_ground_roi[int(h * near_start_ratio):, :] = 255
+    near_start_ratio = 0.28 if category in {"forest", "gravel"} else 0.34
+    near_start_y = int(h * near_start_ratio)
+    for y in range(near_start_y, h):
+        progress = (y - near_start_y) / max(h - near_start_y, 1)
+        if category in {"forest", "gravel"}:
+            # 森林/砂石路场景中，远处真实道路通常集中在画面中心，远山和两侧树林不应大面积标绿。
+            # 因此上方收得更窄，下方逐渐放宽，形成更符合道路透视关系的梯形。
+            half_width = int((0.04 + 0.48 * (progress ** 1.25)) * w)
+        else:
+            half_width = int((0.10 + 0.44 * progress) * w)
+        center_x = w // 2
+        left = max(0, center_x - half_width)
+        right = min(w, center_x + half_width)
+        near_ground_roi[y, left:right] = 255
 
     # 绿色植被识别：这个范围识别草地、树叶、灌木等绿色区域。
     green_hsv = cv2.inRange(hsv, np.array([28, 25, 30]), np.array([96, 255, 255]))
@@ -221,6 +235,16 @@ def build_masks(bgr, hsv, gray, category):
     # 砂石路、灰色路面、泥土路常常颜色不鲜艳，所以 S 较低。
     low_saturation_surface = ((s_ch < 105) & (v_ch > 45) & (v_ch < 240)).astype(np.uint8) * 255
 
+    # 上方远景里的山体也可能是低饱和度，因此容易被误判成灰色砂石路。
+    # 对森林/砂石路场景，在画面上半部分额外排除偏绿、偏蓝的低饱和远景。
+    if category in {"forest", "gravel"}:
+        upper_scene = np.zeros((h, w), dtype=np.uint8)
+        upper_scene[: int(h * 0.52), :] = 255
+        green_blue_far = (
+            (h_ch >= 35) & (h_ch <= 110) & (s_ch >= 18) & (v_ch >= 50) & (upper_scene > 0)
+        ).astype(np.uint8) * 255
+        low_saturation_surface = cv2.bitwise_and(low_saturation_surface, cv2.bitwise_not(green_blue_far))
+
     # 砂石/土壤识别规则 2：棕黄色区域。
     brown_soil_surface = (
         (h_ch >= 4) & (h_ch <= 35) & (s_ch >= 25) & (s_ch <= 185) & (v_ch >= 40) & (v_ch <= 235)
@@ -229,6 +253,33 @@ def build_masks(bgr, hsv, gray, category):
     # 合并两类地面候选区域。
     gravel_or_soil = cv2.bitwise_or(low_saturation_surface, brown_soil_surface)
     gravel_or_soil = cv2.bitwise_and(gravel_or_soil, roi)
+
+    # 草地/田野场景的特殊处理：
+    # 这类图片经常有“车辙/土路 + 两侧高草”。普通的黄色/棕色阈值会把两侧干草也当成土路，
+    # 造成大片草地被标绿。这里额外提取低饱和、偏棕色、且不属于绿色植被的车辙/土路候选。
+    grassland_has_track = False
+    if category == "grassland":
+        track_surface = (
+            (h_ch >= 8)
+            & (h_ch <= 30)
+            & (s_ch >= 35)
+            & (s_ch <= 145)
+            & (v_ch >= 60)
+            & (v_ch <= 220)
+        ).astype(np.uint8) * 255
+        track_surface = cv2.bitwise_and(track_surface, near_ground_roi)
+        track_surface = cv2.bitwise_and(track_surface, cv2.bitwise_not(green_hsv))
+        track_surface = clean_mask(track_surface, kernel_size=5, min_area=260)
+        track_surface = cv2.morphologyEx(
+            track_surface,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+        )
+
+        track_ratio = np.count_nonzero(track_surface) / max(np.count_nonzero(near_ground_roi), 1)
+        if track_ratio > 0.015:
+            gravel_or_soil = track_surface
+            grassland_has_track = True
 
     # 纹理检测：Laplacian 可以检测局部灰度变化。
     # 灰度变化越强，说明纹理越复杂。
@@ -265,10 +316,15 @@ def build_masks(bgr, hsv, gray, category):
 
     # 不同场景下，“可通行”的判断标准稍微不同。
     if category == "grassland":
-        # 草地场景：草地候选区域中，纹理不是特别复杂的部分标为绿色。
-        # 高纹理草丛、花草混杂区域标为黄色，表示需要谨慎。
-        safe_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(high_texture))
-        caution_candidate = cv2.bitwise_and(grass_candidate, high_texture)
+        if grassland_has_track:
+            # 如果图中有明显车辙/土路，优先把车辙/土路标为可通行；
+            # 两侧草地、干草和杂草只标为谨慎通行，避免整片草地被涂绿。
+            safe_candidate = gravel_or_soil
+            caution_candidate = grass_candidate
+        else:
+            # 没有明显车辙时，才退回到“低纹理草地可通行”的规则。
+            safe_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(high_texture))
+            caution_candidate = cv2.bitwise_and(grass_candidate, high_texture)
     else:
         # 森林和砂石路场景：砂石/土壤区域更像道路或可行走地面。
         safe_candidate = gravel_or_soil
@@ -431,12 +487,8 @@ def collect_images() -> list[tuple[str, str, Path]]:
     return items
 
 
-def main():
-    """程序入口：收集图片、逐张处理、保存结果。"""
-    parser = argparse.ArgumentParser(description="题目二：安全地形可通行区域仿真")
-    parser.add_argument("--no-show", action="store_true", help="只保存结果，不弹出图像窗口")
-    args = parser.parse_args()
-
+def run_batch(no_show: bool = False):
+    """批量处理 data 目录中的示例图片，并生成结果图。"""
     setup_matplotlib_font()
     RESULT_DIR.mkdir(exist_ok=True)
 
@@ -458,9 +510,28 @@ def main():
     print(f"\n全部完成。总览图：{summary_path}")
     print(f"单张分析图和最终结果图保存在：{RESULT_DIR}")
 
-    # 默认会弹出结果窗口；如果命令行加 --no-show，则只保存不弹窗。
-    if not args.no_show:
+    # 如果命令行加 --no-show，则只保存不弹窗。
+    if not no_show:
         plt.show()
+
+
+def main():
+    """程序入口。
+
+    默认打开 UI 界面；只有加 --batch 时才执行原来的批量处理流程。
+    """
+    parser = argparse.ArgumentParser(description="题目二：安全地形可通行区域仿真")
+    parser.add_argument("--batch", action="store_true", help="批量处理 data 目录中的示例图片")
+    parser.add_argument("--no-show", action="store_true", help="批量处理时只保存结果，不弹出图像窗口")
+    args = parser.parse_args()
+
+    if args.batch:
+        run_batch(no_show=args.no_show)
+        return
+
+    from app import main as launch_ui
+
+    launch_ui()
 
 
 if __name__ == "__main__":
