@@ -17,8 +17,6 @@
 
 最终结果颜色说明：
     绿色：可通行候选区域
-    黄色：植被或不确定区域，需要谨慎通行
-    红色：障碍物或危险区域
 """
 
 from __future__ import annotations
@@ -356,25 +354,18 @@ def build_masks(bgr, hsv, gray, category):
     }
 
 
-def overlay_result(bgr, safe, caution, obstacle):
-    """把识别结果叠加到原图上，生成最终可视化结果。
+def overlay_result(bgr, safe, caution=None, obstacle=None):
+    """把最终可通行区域叠加到原图上。
 
-    颜色说明：
-    - 绿色：可通行区域
-    - 黄色：谨慎通行区域
-    - 红色：障碍物或危险区域
+    最终结果只显示绿色的可通行区域；谨慎区和危险/障碍区只参与内部计算，不在结果图中展示。
     """
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     out = rgb.copy()
 
     green = np.array([0, 220, 90], dtype=np.uint8)
-    yellow = np.array([255, 205, 45], dtype=np.uint8)
-    red = np.array([245, 50, 50], dtype=np.uint8)
 
-    # alpha 混合：不是直接覆盖颜色，而是把结果颜色半透明叠加到原图上。
-    out[caution > 0] = (0.62 * out[caution > 0] + 0.38 * yellow).astype(np.uint8)
+    # alpha 混合：最终图只把可通行区域用绿色半透明叠加到原图上。
     out[safe > 0] = (0.55 * out[safe > 0] + 0.45 * green).astype(np.uint8)
-    out[obstacle > 0] = (0.52 * out[obstacle > 0] + 0.48 * red).astype(np.uint8)
     return out
 
 
@@ -417,7 +408,7 @@ def save_analysis_figure(image_path: Path, category: str, label: str) -> tuple[P
         ("HSV-H 色调通道", h_channel, "gray"),
         (vegetation_panel_title, vegetation_panel, "gray"),
         ("砂石/土壤候选", masks["gravel_or_soil"], "gray"),
-        ("障碍物候选", masks["obstacle"], "gray"),
+        ("可通行掩膜", masks["safe"], "gray"),
         ("最终可通行结果", overlay, None),
     ]
 
@@ -431,7 +422,7 @@ def save_analysis_figure(image_path: Path, category: str, label: str) -> tuple[P
     fig.text(
         0.5,
         0.02,
-        "颜色说明：绿色=可通行候选区域；黄色=植被/需谨慎区域；红色=障碍物或危险区域。",
+        "颜色说明：绿色=可通行候选区域。",
         ha="center",
         fontsize=10,
     )
@@ -451,7 +442,7 @@ def save_analysis_figure(image_path: Path, category: str, label: str) -> tuple[P
     final_fig.text(
         0.5,
         0.02,
-        "绿色=可通行；黄色=谨慎通行；红色=障碍/危险。",
+        "绿色=可通行区域。",
         ha="center",
         fontsize=10,
     )

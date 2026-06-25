@@ -245,8 +245,6 @@ class TerrainApp:
         legend = tk.Frame(parent, bg=COLORS["sidebar"], padx=24, pady=20)
         legend.pack(fill="x")
         self._legend_row(legend, COLORS["green"], "绿色：可通行")
-        self._legend_row(legend, COLORS["yellow"], "黄色：谨慎通行")
-        self._legend_row(legend, COLORS["red"], "红色：障碍/危险")
 
     def _legend_row(self, parent: tk.Frame, color: str, text: str) -> None:
         row = tk.Frame(parent, bg=COLORS["sidebar"])
@@ -293,7 +291,7 @@ class TerrainApp:
             ("h_channel", "HSV-H 色调通道"),
             ("vegetation", "植被/草地候选"),
             ("surface", "砂石/土壤候选"),
-            ("obstacle", "障碍物候选"),
+            ("obstacle", "可通行掩膜"),
             ("overlay", "最终可通行区域"),
         ]
         for index, (key, title) in enumerate(panel_defs):
@@ -418,7 +416,7 @@ class TerrainApp:
             "h_channel": Image.fromarray(h_channel).convert("RGB"),
             "vegetation": Image.fromarray(masks[vegetation_key]).convert("RGB"),
             "surface": Image.fromarray(masks["gravel_or_soil"]).convert("RGB"),
-            "obstacle": Image.fromarray(masks["obstacle"]).convert("RGB"),
+            "obstacle": Image.fromarray(masks["safe"]).convert("RGB"),
             "overlay": Image.fromarray(overlay),
         }
 
