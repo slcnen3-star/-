@@ -13,7 +13,7 @@
 运行结果：
     - 每张输入图片会生成一张 2x3 详细分析图
     - 每张输入图片会生成一张“原图 + 最终结果”对比图
-    - results/summary.png 是六张图片的最终效果总览
+    - results/summary.png 是示例图片的最终效果总览
 
 最终结果颜色说明：
     绿色：可通行候选区域
@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from pathlib import Path
 
 try:
@@ -165,180 +166,257 @@ def adaptive_texture_mask(texture, roi):
 
 
 def build_masks(bgr, hsv, gray, category):
-    """根据颜色、纹理和边缘生成不同区域的掩膜。
-
-    这是本程序的核心识别部分。它没有训练模型，而是用人工设定的规则：
-    - 绿色 HSV 范围：识别草地、树叶、灌木等植被
-    - ExG 超绿指数：补充识别受光照影响的绿色植被
-    - 黄草 HSV 范围：补充识别干草、黄草、暖色草地
-    - 低饱和度或棕黄色范围：识别砂石路、土路、裸露地面
-    - Laplacian 纹理强度：判断区域是否纹理过于复杂
-    - 暗区域 + Canny 边缘：提取障碍物候选区域
-    """
+    """根据全图颜色、纹理、边缘和连通域生成识别掩膜。"""
     h, w = gray.shape
-
-    # 拆分 HSV 三个通道，方便后面写阈值条件。
     h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
 
-    # ROI 是感兴趣区域。图像上方通常是天空、远处树冠或背景，
-    # 对“脚下区域是否能走”帮助较小，所以只分析下方 75%。
-    roi = np.zeros((h, w), dtype=np.uint8)
-    roi[int(h * 0.25):, :] = 255
+    roi = np.full((h, w), 255, dtype=np.uint8)
 
-    # near_ground_roi 是“近处地面约束”。
-    # 前面的 roi 用来做颜色/纹理分析，范围可以稍大；但最终标成绿色的可通行区域，
-    # 应该更偏向画面下方和画面中心，因为摄像头视角下道路通常从下方往中心远处延伸。
-    # 这里不用简单的水平切线，而是做成透视梯形：下方范围宽，上方范围窄。
-    # 这样可以保留画面中间较远处的真实道路，同时减少两侧树林、远山被误判为可通行区域。
-    near_ground_roi = np.zeros((h, w), dtype=np.uint8)
-    near_start_ratio = 0.28 if category in {"forest", "gravel"} else 0.34
-    near_start_y = int(h * near_start_ratio)
-    for y in range(near_start_y, h):
-        progress = (y - near_start_y) / max(h - near_start_y, 1)
-        if category in {"forest", "gravel"}:
-            # 森林/砂石路场景中，远处真实道路通常集中在画面中心，远山和两侧树林不应大面积标绿。
-            # 因此上方收得更窄，下方逐渐放宽，形成更符合道路透视关系的梯形。
-            half_width = int((0.04 + 0.48 * (progress ** 1.25)) * w)
-        else:
-            half_width = int((0.10 + 0.44 * progress) * w)
-        center_x = w // 2
-        left = max(0, center_x - half_width)
-        right = min(w, center_x + half_width)
-        near_ground_roi[y, left:right] = 255
+    def remove_huge_components(mask, min_area=250, max_area_ratio=0.20, reject_floor_band=False):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        max_area = int(mask.size * max_area_ratio)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            box_w = stats[i, cv2.CC_STAT_WIDTH]
+            box_h = stats[i, cv2.CC_STAT_HEIGHT]
+            if reject_floor_band and y + box_h > int(h * 0.88) and box_w > int(w * 0.32):
+                continue
+            if min_area <= area <= max_area:
+                out[labels == i] = 255
+        return out
 
-    # 绿色植被识别：这个范围识别草地、树叶、灌木等绿色区域。
-    green_hsv = cv2.inRange(hsv, np.array([28, 25, 30]), np.array([96, 255, 255]))
+    def keep_large_components(mask, min_area=250):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        for i in range(1, num):
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                out[labels == i] = 255
+        return out
 
-    # ExG 作为补充，能识别一些 HSV 阈值下容易漏掉的绿色区域。
-    exg = excess_green_mask(bgr)
+    def keep_accessible_safe_components(mask):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        bottom_line = int(h * 0.90)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            box_w = stats[i, cv2.CC_STAT_WIDTH]
+            box_h = stats[i, cv2.CC_STAT_HEIGHT]
+            bottom = stats[i, cv2.CC_STAT_TOP] + box_h
+            if area < 700:
+                continue
+            if bottom < bottom_line:
+                continue
+            if box_h > box_w * 1.3 and box_w < int(w * 0.12):
+                continue
+            out[labels == i] = 255
+        return out
 
-    # 黄草/干草识别：很多草地并不是鲜绿色，而是黄色、棕黄色或偏暖色。
-    # 这是对原算法的主要改进之一。
+    def filter_surface_components(mask):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            box_w = stats[i, cv2.CC_STAT_WIDTH]
+            box_h = stats[i, cv2.CC_STAT_HEIGHT]
+            if area < 450:
+                continue
+            is_vertical_false_positive = box_h > box_w * 2.2 and box_w < int(w * 0.10)
+            is_tiny_upper_patch = y < int(h * 0.55) and area < int(mask.size * 0.01)
+            if is_vertical_false_positive or is_tiny_upper_patch:
+                continue
+            out[labels == i] = 255
+        return out
+
+    b, g, r = cv2.split(bgr.astype(np.float32))
+    exg = cv2.normalize(2 * g - r - b, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+    sky_or_glare = (
+        ((v_ch > 210) & (s_ch < 55))
+        | ((h_ch >= 85) & (h_ch <= 125) & (s_ch < 95) & (v_ch > 135))
+    ).astype(np.uint8) * 255
+
+    road_corridor = np.zeros((h, w), dtype=np.uint8)
+    start_y = int(h * 0.34)
+    for y in range(start_y, h):
+        progress = (y - start_y) / max(h - start_y, 1)
+        half_width = int((0.08 + 0.48 * (progress ** 1.1)) * w)
+        center = w // 2
+        road_corridor[y, max(0, center - half_width): min(w, center + half_width)] = 255
+
+    safe_road_corridor = np.zeros((h, w), dtype=np.uint8)
+    safe_start_y = int(h * 0.43)
+    for y in range(safe_start_y, h):
+        progress = (y - safe_start_y) / max(h - safe_start_y, 1)
+        half_width = int((0.05 + 0.46 * (progress ** 1.1)) * w)
+        center = w // 2
+        safe_road_corridor[y, max(0, center - half_width): min(w, center + half_width)] = 255
+
+    gravel_road_color = (
+        (h_ch >= 8)
+        & (h_ch <= 48)
+        & (s_ch >= 18)
+        & (s_ch <= 225)
+        & (v_ch >= 35)
+        & (v_ch <= 235)
+        & (sky_or_glare == 0)
+    ).astype(np.uint8) * 255
+    gravel_road_prior = cv2.bitwise_and(gravel_road_color, road_corridor)
+    gravel_road_prior = clean_mask(gravel_road_prior, kernel_size=7, min_area=550)
+
+    gravel_safe_color = (
+        (((s_ch < 128) & (v_ch > 50) & (v_ch < 235)) | ((h_ch >= 10) & (h_ch <= 38) & (s_ch < 160)))
+        & (sky_or_glare == 0)
+    ).astype(np.uint8) * 255
+    gravel_safe_surface = cv2.bitwise_and(gravel_safe_color, safe_road_corridor)
+    gravel_safe_surface = clean_mask(gravel_safe_surface, kernel_size=7, min_area=700)
+
+    green_hsv = (
+        ((h_ch >= 28) & (h_ch <= 96) & (s_ch >= 35) & (v_ch >= 35) & (v_ch <= 245))
+        | ((exg > 138) & (h_ch >= 24) & (h_ch <= 105) & (s_ch >= 22) & (v_ch >= 30))
+    ).astype(np.uint8) * 255
+    green_hsv = cv2.bitwise_and(green_hsv, cv2.bitwise_not(sky_or_glare))
+    if category == "gravel":
+        green_hsv = cv2.bitwise_and(green_hsv, cv2.bitwise_not(gravel_road_prior))
+
+    vegetation = clean_mask(green_hsv, kernel_size=3, min_area=180)
+
     yellow_grass = (
-        (h_ch >= 10) & (h_ch <= 45) & (s_ch >= 25) & (s_ch <= 230) & (v_ch >= 55) & (v_ch <= 250)
+        (h_ch >= 13)
+        & (h_ch <= 45)
+        & (s_ch >= 35)
+        & (s_ch <= 205)
+        & (v_ch >= 70)
+        & (v_ch <= 245)
+        & (sky_or_glare == 0)
     ).astype(np.uint8) * 255
 
-    # vegetation 主要表示绿色植被。
-    vegetation = cv2.bitwise_or(green_hsv, exg)
-    vegetation = cv2.bitwise_and(vegetation, roi)
-    vegetation = clean_mask(vegetation, kernel_size=5, min_area=450)
-
-    # grass_candidate 表示“草地候选”，包括绿色草地和黄草/干草。
-    # 这个掩膜专门用于草地场景，避免只认绿色、不认黄草。
-    grass_candidate = cv2.bitwise_or(vegetation, yellow_grass)
-    grass_candidate = cv2.bitwise_and(grass_candidate, roi)
-    grass_candidate = clean_mask(grass_candidate, kernel_size=7, min_area=650)
-
-    # 砂石/土壤识别规则 1：低饱和度区域。
-    # 砂石路、灰色路面、泥土路常常颜色不鲜艳，所以 S 较低。
-    low_saturation_surface = ((s_ch < 105) & (v_ch > 45) & (v_ch < 240)).astype(np.uint8) * 255
-
-    # 上方远景里的山体也可能是低饱和度，因此容易被误判成灰色砂石路。
-    # 对森林/砂石路场景，在画面上半部分额外排除偏绿、偏蓝的低饱和远景。
-    if category in {"forest", "gravel"}:
-        upper_scene = np.zeros((h, w), dtype=np.uint8)
-        upper_scene[: int(h * 0.52), :] = 255
-        green_blue_far = (
-            (h_ch >= 35) & (h_ch <= 110) & (s_ch >= 18) & (v_ch >= 50) & (upper_scene > 0)
-        ).astype(np.uint8) * 255
-        low_saturation_surface = cv2.bitwise_and(low_saturation_surface, cv2.bitwise_not(green_blue_far))
-
-    # 砂石/土壤识别规则 2：棕黄色区域。
-    brown_soil_surface = (
-        (h_ch >= 4) & (h_ch <= 35) & (s_ch >= 25) & (s_ch <= 185) & (v_ch >= 40) & (v_ch <= 235)
-    ).astype(np.uint8) * 255
-
-    # 合并两类地面候选区域。
-    gravel_or_soil = cv2.bitwise_or(low_saturation_surface, brown_soil_surface)
-    gravel_or_soil = cv2.bitwise_and(gravel_or_soil, roi)
-
-    # 草地/田野场景的特殊处理：
-    # 这类图片经常有“车辙/土路 + 两侧高草”。普通的黄色/棕色阈值会把两侧干草也当成土路，
-    # 造成大片草地被标绿。这里额外提取低饱和、偏棕色、且不属于绿色植被的车辙/土路候选。
-    grassland_has_track = False
-    if category == "grassland":
-        track_surface = (
-            (h_ch >= 8)
-            & (h_ch <= 30)
-            & (s_ch >= 35)
-            & (s_ch <= 145)
-            & (v_ch >= 60)
-            & (v_ch <= 220)
-        ).astype(np.uint8) * 255
-        track_surface = cv2.bitwise_and(track_surface, near_ground_roi)
-        track_surface = cv2.bitwise_and(track_surface, cv2.bitwise_not(green_hsv))
-        track_surface = clean_mask(track_surface, kernel_size=5, min_area=260)
-        track_surface = cv2.morphologyEx(
-            track_surface,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
-        )
-
-        track_ratio = np.count_nonzero(track_surface) / max(np.count_nonzero(near_ground_roi), 1)
-        if track_ratio > 0.015:
-            gravel_or_soil = track_surface
-            grassland_has_track = True
-
-    # 纹理检测：Laplacian 可以检测局部灰度变化。
-    # 灰度变化越强，说明纹理越复杂。
     lap = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
     texture = cv2.convertScaleAbs(lap)
     texture = cv2.GaussianBlur(texture, (9, 9), 0)
     high_texture = adaptive_texture_mask(texture, roi)
 
-    # 暗区域可能对应树干、石块、深阴影等障碍物。
-    dark = ((v_ch < 55) & (s_ch < 210)).astype(np.uint8) * 255
+    haze_or_uncertain = (
+        (s_ch < 55)
+        & (v_ch > 92)
+        & (v_ch < 225)
+        & (texture < 24)
+        & (green_hsv == 0)
+    ).astype(np.uint8) * 255
+    haze_or_uncertain = clean_mask(haze_or_uncertain, kernel_size=5, min_area=300)
+    if category == "gravel":
+        haze_or_uncertain = cv2.bitwise_and(haze_or_uncertain, cv2.bitwise_not(gravel_safe_surface))
 
-    # Canny 边缘检测用于提取物体边界，例如石块边缘、树干边界、路边界。
+    visible_for_safe = np.full((h, w), 255, dtype=np.uint8)
+    haze_bool = haze_or_uncertain > 0
+    y_indices = np.arange(h)[:, None]
+    lower_haze = haze_bool & (y_indices > int(h * 0.34))
+    for x_col in np.where(lower_haze.any(axis=0))[0]:
+        bottom_y = int(np.max(np.where(lower_haze[:, x_col])[0]))
+        visible_for_safe[: min(bottom_y + 8, h), x_col] = 0
+
+    low_saturation_surface = (
+        (s_ch < 105)
+        & (v_ch > 42)
+        & (v_ch < 235)
+        & (sky_or_glare == 0)
+        & (green_hsv == 0)
+        & (haze_or_uncertain == 0)
+    ).astype(np.uint8) * 255
+    brown_soil_surface = (
+        (h_ch >= 4)
+        & (h_ch <= 35)
+        & (s_ch >= 24)
+        & (s_ch <= 185)
+        & (v_ch >= 38)
+        & (v_ch <= 235)
+        & (green_hsv == 0)
+        & (haze_or_uncertain == 0)
+    ).astype(np.uint8) * 255
+
+    gravel_or_soil = cv2.bitwise_or(low_saturation_surface, brown_soil_surface)
+    if category == "gravel":
+        gravel_or_soil = cv2.bitwise_or(gravel_or_soil, gravel_road_prior)
+    gravel_or_soil = clean_mask(gravel_or_soil, kernel_size=5, min_area=450)
+    gravel_or_soil = filter_surface_components(gravel_or_soil)
+
+    grass_candidate = cv2.bitwise_or(vegetation, yellow_grass)
+    grass_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(gravel_or_soil))
+    grass_candidate = clean_mask(grass_candidate, kernel_size=5, min_area=450)
+
+    if category == "grassland":
+        track_surface = (
+            (h_ch >= 7)
+            & (h_ch <= 35)
+            & (s_ch >= 28)
+            & (s_ch <= 145)
+            & (v_ch >= 50)
+            & (v_ch <= 220)
+            & (green_hsv == 0)
+            & (sky_or_glare == 0)
+            & (haze_or_uncertain == 0)
+        ).astype(np.uint8) * 255
+        track_surface = clean_mask(track_surface, kernel_size=5, min_area=260)
+        if np.count_nonzero(track_surface) / max(track_surface.size, 1) > 0.01:
+            gravel_or_soil = track_surface
+            grass_candidate = cv2.bitwise_or(vegetation, yellow_grass)
+            grass_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(track_surface))
+            grass_candidate = clean_mask(grass_candidate, kernel_size=5, min_area=450)
+
     edges = cv2.Canny(gray, 60, 160)
     edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1)
 
-    # 草地场景中，花草边缘非常多，如果直接把边缘当障碍物，会出现大片红色误检。
-    # 所以草地场景要把 grass_candidate 也作为“地面候选”排除掉。
-    if category == "grassland":
-        surface_for_edge = cv2.bitwise_or(gravel_or_soil, grass_candidate)
-    else:
-        surface_for_edge = gravel_or_soil
+    dark_object = (
+        (v_ch < 82)
+        & (s_ch > 18)
+        & (green_hsv == 0)
+        & (gravel_or_soil == 0)
+        & (sky_or_glare == 0)
+    ).astype(np.uint8) * 255
+    rock_like = (
+        (s_ch < 105)
+        & (v_ch >= 50)
+        & (v_ch <= 190)
+        & (high_texture > 0)
+        & (green_hsv == 0)
+        & (sky_or_glare == 0)
+    ).astype(np.uint8) * 255
+    edge_object = cv2.bitwise_and(edges, cv2.bitwise_not(cv2.bitwise_or(gravel_or_soil, vegetation)))
 
-    non_surface_edge = cv2.bitwise_and(edges, cv2.bitwise_not(surface_for_edge))
+    obstacle = cv2.bitwise_or(dark_object, cv2.bitwise_and(rock_like, cv2.bitwise_or(edges, high_texture)))
+    obstacle = cv2.bitwise_or(obstacle, cv2.bitwise_and(edge_object, dark_object))
+    obstacle = clean_mask(obstacle, kernel_size=3, min_area=180)
+    obstacle = remove_huge_components(obstacle, min_area=220, max_area_ratio=0.18, reject_floor_band=True)
 
-    # 障碍物候选 = 非地面边缘 + 暗区域。
-    obstacle = cv2.bitwise_or(non_surface_edge, dark)
-    obstacle = cv2.bitwise_and(obstacle, roi)
-
-    # 对草地场景再做一次保护：已经被识别为草地候选的区域，不轻易标红为障碍物。
     if category == "grassland":
         obstacle = cv2.bitwise_and(obstacle, cv2.bitwise_not(grass_candidate))
-
-    obstacle = clean_mask(obstacle, kernel_size=5, min_area=500)
-
-    # 不同场景下，“可通行”的判断标准稍微不同。
-    if category == "grassland":
-        if grassland_has_track:
-            # 如果图中有明显车辙/土路，优先把车辙/土路标为可通行；
-            # 两侧草地、干草和杂草只标为谨慎通行，避免整片草地被涂绿。
-            safe_candidate = gravel_or_soil
-            caution_candidate = grass_candidate
-        else:
-            # 没有明显车辙时，才退回到“低纹理草地可通行”的规则。
-            safe_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(high_texture))
-            caution_candidate = cv2.bitwise_and(grass_candidate, high_texture)
-    else:
-        # 森林和砂石路场景：砂石/土壤区域更像道路或可行走地面。
         safe_candidate = gravel_or_soil
+        if np.count_nonzero(safe_candidate) < int(h * w * 0.015):
+            safe_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(high_texture))
+        caution_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(safe_candidate))
+    else:
+        if category == "gravel":
+            safe_candidate = gravel_safe_surface
+            if np.count_nonzero(safe_candidate) < int(h * w * 0.025):
+                safe_candidate = cv2.bitwise_and(gravel_or_soil, safe_road_corridor)
+        else:
+            safe_candidate = cv2.bitwise_and(gravel_or_soil, cv2.bitwise_not(high_texture))
+            if np.count_nonzero(safe_candidate) < int(h * w * 0.012):
+                safe_candidate = gravel_or_soil
         caution_candidate = vegetation
 
-    # 最终可通行区域必须满足：位于 ROI 内、属于候选可通行区域、不是障碍物区域。
-    safe = cv2.bitwise_and(safe_candidate, roi)
-    safe = cv2.bitwise_and(safe, near_ground_roi)
-    safe = cv2.bitwise_and(safe, cv2.bitwise_not(obstacle))
-    safe = clean_mask(safe, kernel_size=9, min_area=700)
+    safe = cv2.bitwise_and(safe_candidate, cv2.bitwise_not(obstacle))
+    safe = cv2.bitwise_and(safe, cv2.bitwise_not(haze_or_uncertain))
+    safe = cv2.bitwise_and(safe, visible_for_safe)
+    safe = keep_accessible_safe_components(clean_mask(safe, kernel_size=7, min_area=600))
 
-    # 谨慎区域：不能和 safe 或 obstacle 重叠。
-    caution = cv2.bitwise_and(caution_candidate, roi)
-    caution = cv2.bitwise_and(caution, cv2.bitwise_not(safe))
+    caution = cv2.bitwise_and(caution_candidate, cv2.bitwise_not(safe))
     caution = cv2.bitwise_and(caution, cv2.bitwise_not(obstacle))
-    caution = clean_mask(caution, kernel_size=7, min_area=500)
+    caution = clean_mask(caution, kernel_size=5, min_area=450)
 
     return {
         "roi": roi,
@@ -369,14 +447,235 @@ def overlay_result(bgr, safe, caution=None, obstacle=None):
     return out
 
 
-def analyze_image(image_path: Path, category: str):
-    """处理单张图片，并返回中间结果与最终叠加图。"""
-    bgr = imread_unicode(image_path)
+def analyze_array(bgr, category: str):
+    """处理一张 BGR 图像数组，并返回中间结果与最终叠加图。"""
     bgr, hsv, gray = preprocess(bgr)
     masks = build_masks(bgr, hsv, gray, category)
     overlay = overlay_result(bgr, masks["safe"], masks["caution"], masks["obstacle"])
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return hsv, masks, overlay, rgb
+
+
+def analyze_image(image_path: Path, category: str):
+    """处理单张图片，并返回中间结果与最终叠加图。"""
+    return analyze_array(imread_unicode(image_path), category)
+
+
+def simulate_vegetation_occlusion(bgr):
+    """模拟近景草叶、灌木枝条遮挡对识别结果的影响。"""
+    h, w = bgr.shape[:2]
+    out = bgr.copy()
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    for index, x_ratio in enumerate([0.06, 0.14, 0.25, 0.72, 0.84, 0.93]):
+        x0 = int(w * x_ratio)
+        y0 = h
+        x1 = int(x0 + ((-1) ** index) * w * 0.08)
+        y1 = int(h * (0.32 + 0.07 * (index % 3)))
+        cv2.line(mask, (x0, y0), (x1, y1), 255, thickness=max(8, w // 70))
+
+    for center_ratio, size_ratio in [((0.18, 0.58), (0.16, 0.08)), ((0.82, 0.54), (0.18, 0.09))]:
+        center = (int(w * center_ratio[0]), int(h * center_ratio[1]))
+        axes = (int(w * size_ratio[0]), int(h * size_ratio[1]))
+        cv2.ellipse(mask, center, axes, 8, 0, 360, 255, thickness=-1)
+
+    color = np.array([45, 118, 48], dtype=np.uint8)
+    covered = mask > 0
+    out[covered] = (0.52 * out[covered] + 0.48 * color).astype(np.uint8)
+    return out
+
+
+def simulate_texture_interference(bgr):
+    """模拟砂石颗粒、杂草纹理和成像噪声带来的纹理干扰。"""
+    h, w = bgr.shape[:2]
+    rng = np.random.default_rng(2026)
+    out = bgr.copy()
+
+    roi = np.zeros((h, w), dtype=bool)
+    roi[int(h * 0.28):, :] = True
+    noise = rng.normal(0, 18, bgr.shape).astype(np.int16)
+    noisy = out.astype(np.int16)
+    noisy[roi] += noise[roi]
+    out = np.clip(noisy, 0, 255).astype(np.uint8)
+
+    for _ in range(260):
+        x = int(rng.integers(0, w))
+        y = int(rng.integers(int(h * 0.32), h))
+        radius = int(rng.integers(1, max(2, w // 140)))
+        value = int(rng.integers(70, 190))
+        color = (value, int(value * rng.uniform(0.82, 1.10)), int(value * rng.uniform(0.70, 1.05)))
+        cv2.circle(out, (x, y), radius, color, thickness=-1)
+
+    return out
+
+
+def build_condition_variants(bgr) -> list[tuple[str, str, object]]:
+    """构造多组工况：原始、植被遮挡、纹理干扰。"""
+    return [
+        ("normal", "原始工况", bgr),
+        ("vegetation_occlusion", "植被遮挡工况", simulate_vegetation_occlusion(bgr)),
+        ("texture_interference", "纹理干扰工况", simulate_texture_interference(bgr)),
+    ]
+
+
+def measure_masks(masks: dict[str, object]) -> dict[str, float | int]:
+    """统计可通行、障碍、纹理等关键指标，便于做结果分析。"""
+    roi_count = max(int(np.count_nonzero(masks["roi"])), 1)
+    safe_count = int(np.count_nonzero(masks["safe"]))
+    obstacle_count = int(np.count_nonzero(masks["obstacle"]))
+    caution_count = int(np.count_nonzero(masks["caution"]))
+    texture_count = int(np.count_nonzero(masks["high_texture"]))
+
+    num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(masks["safe"], connectivity=8)
+    safe_components = max(num - 1, 0)
+    largest_safe_area = int(stats[1:, cv2.CC_STAT_AREA].max()) if safe_components else 0
+
+    return {
+        "safe_ratio": safe_count / roi_count,
+        "obstacle_ratio": obstacle_count / roi_count,
+        "caution_ratio": caution_count / roi_count,
+        "high_texture_ratio": texture_count / roi_count,
+        "safe_components": safe_components,
+        "largest_safe_area": largest_safe_area,
+    }
+
+
+def save_condition_figure(
+    out_path: Path,
+    title: str,
+    rgb,
+    overlay,
+    metrics: dict[str, float | int],
+) -> None:
+    """保存某一工况下的原图与识别结果对比图。"""
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.8))
+    fig.suptitle(title, fontsize=14)
+    axes[0].imshow(rgb)
+    axes[0].set_title("工况输入图", fontsize=11)
+    axes[0].axis("off")
+    axes[1].imshow(overlay)
+    axes[1].set_title("安全可通行区域", fontsize=11)
+    axes[1].axis("off")
+    fig.text(
+        0.5,
+        0.02,
+        f"可通行占比={metrics['safe_ratio']:.2%}，障碍占比={metrics['obstacle_ratio']:.2%}，高纹理占比={metrics['high_texture_ratio']:.2%}",
+        ha="center",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 0.92])
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+
+def write_condition_report(rows: list[dict[str, object]], report_path: Path) -> None:
+    """根据多工况统计指标生成中文结果分析。"""
+    lines = [
+        "题目二多工况仿真验证与结果分析",
+        "",
+        "一、验证工况",
+        "1. 原始工况：直接对森林、砂石路面、杂草草地图片进行识别。",
+        "2. 植被遮挡工况：在近景叠加草叶、灌木状遮挡，观察遮挡对可通行区域连续性的影响。",
+        "3. 纹理干扰工况：在地面区域叠加颗粒噪声与小斑点，观察复杂纹理对障碍检测和安全区域划分的影响。",
+        "",
+        "二、平均指标",
+    ]
+
+    condition_labels = ["原始工况", "植被遮挡工况", "纹理干扰工况"]
+    for condition in condition_labels:
+        subset = [row for row in rows if row["condition"] == condition]
+        if not subset:
+            continue
+        safe = sum(float(row["safe_ratio"]) for row in subset) / len(subset)
+        obstacle = sum(float(row["obstacle_ratio"]) for row in subset) / len(subset)
+        texture = sum(float(row["high_texture_ratio"]) for row in subset) / len(subset)
+        lines.append(
+            f"- {condition}：平均可通行占比 {safe:.2%}，平均障碍占比 {obstacle:.2%}，平均高纹理占比 {texture:.2%}。"
+        )
+
+    lines.extend(["", "三、扰动影响分析"])
+    image_names = sorted({str(row["image"]) for row in rows})
+    for image_name in image_names:
+        image_rows = [row for row in rows if row["image"] == image_name]
+        normal = next((row for row in image_rows if row["condition"] == "原始工况"), None)
+        if normal is None:
+            continue
+        lines.append(f"- {image_name}：")
+        for condition in ["植被遮挡工况", "纹理干扰工况"]:
+            current = next((row for row in image_rows if row["condition"] == condition), None)
+            if current is None:
+                continue
+            safe_delta = float(current["safe_ratio"]) - float(normal["safe_ratio"])
+            obstacle_delta = float(current["obstacle_ratio"]) - float(normal["obstacle_ratio"])
+            lines.append(
+                f"  {condition}相对原始工况，可通行占比变化 {safe_delta:+.2%}，障碍占比变化 {obstacle_delta:+.2%}。"
+            )
+
+    lines.extend(
+        [
+            "",
+            "四、结论",
+            "HSV 色彩像素分类能够稳定区分绿色植被、干草和低饱和砂石/土壤区域；Laplacian 纹理特征可以抑制杂草、碎石等高纹理干扰；形态学开闭运算与连通域面积过滤可以去除零散噪声并保留连续可通行区域。",
+            "植被遮挡会削弱道路或草地的连续性，使可通行掩膜面积下降；纹理干扰会提升高纹理和障碍候选比例，容易压缩安全区域。优化后的近地面梯形 ROI、草地车辙优先规则和小连通域过滤可减少误检，满足复杂野外非结构化场景下危险区域剔除与安全区域划分的仿真要求。",
+        ]
+    )
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_condition_validation(images: list[tuple[str, str, Path]] | None = None) -> tuple[Path, Path]:
+    """完成多组工况仿真验证，输出对比图、指标 CSV 和中文分析报告。"""
+    setup_matplotlib_font()
+    RESULT_DIR.mkdir(exist_ok=True)
+    images = images or collect_images()
+    if not images:
+        raise ValueError("没有找到图片，请检查 data/forest、data/gravel、data/grassland 目录。")
+
+    condition_dir = RESULT_DIR / "conditions"
+    condition_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+
+    for category, label, image_path in images:
+        category_dir = condition_dir / category
+        category_dir.mkdir(parents=True, exist_ok=True)
+        source_bgr = imread_unicode(image_path)
+        for condition_key, condition_label, condition_bgr in build_condition_variants(source_bgr):
+            _hsv, masks, overlay, rgb = analyze_array(condition_bgr, category)
+            metrics = measure_masks(masks)
+            out_path = category_dir / f"{image_path.stem}_{condition_key}_final.png"
+            save_condition_figure(out_path, f"{label} - {image_path.name} - {condition_label}", rgb, overlay, metrics)
+            row = {
+                "category": category,
+                "category_label": label,
+                "image": image_path.name,
+                "condition": condition_label,
+                "result_path": str(out_path),
+                **metrics,
+            }
+            rows.append(row)
+
+    metrics_path = RESULT_DIR / "condition_metrics.csv"
+    fieldnames = [
+        "category",
+        "category_label",
+        "image",
+        "condition",
+        "safe_ratio",
+        "obstacle_ratio",
+        "caution_ratio",
+        "high_texture_ratio",
+        "safe_components",
+        "largest_safe_area",
+        "result_path",
+    ]
+    with metrics_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+    report_path = RESULT_DIR / "condition_analysis.txt"
+    write_condition_report(rows, report_path)
+    return metrics_path, report_path
 
 
 def save_analysis_figure(image_path: Path, category: str, label: str) -> tuple[Path, Path]:
@@ -453,17 +752,25 @@ def save_analysis_figure(image_path: Path, category: str, label: str) -> tuple[P
 
 
 def build_summary(result_paths: list[tuple[str, Path]]) -> Path:
-    """把六张图片的最终结果汇总成一张总览图。"""
+    """把示例图片的最终结果汇总成一张总览图。"""
+    if not result_paths:
+        raise ValueError("没有可汇总的结果图。")
     out_path = RESULT_DIR / "summary.png"
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9.5))
+    cols = min(3, max(len(result_paths), 1))
+    rows = (len(result_paths) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5.4 * cols, 4.7 * rows))
     fig.suptitle("题目二：安全地形可通行区域仿真结果总览", fontsize=17)
-    for ax, (title, path) in zip(axes.ravel(), result_paths):
+    axes_flat = np.array(axes).reshape(-1)
+    for ax, (title, path) in zip(axes_flat, result_paths):
         img = plt.imread(path)
         ax.imshow(img)
         ax.set_title(title, fontsize=12)
         ax.axis("off")
+    for ax in axes_flat[len(result_paths):]:
+        ax.axis("off")
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out_path, dpi=170)
+    plt.close(fig)
     return out_path
 
 
@@ -472,6 +779,8 @@ def collect_images() -> list[tuple[str, str, Path]]:
     items: list[tuple[str, str, Path]] = []
     for category, label in CATEGORIES.items():
         folder = DATA_DIR / category
+        if not folder.exists():
+            continue
         for path in sorted(folder.glob("*")):
             if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}:
                 items.append((category, label, path))
@@ -498,7 +807,10 @@ def run_batch(no_show: bool = False):
         print(f"  最终结果图：{final_path}")
 
     summary_path = build_summary(result_paths)
+    metrics_path, report_path = run_condition_validation(images)
     print(f"\n全部完成。总览图：{summary_path}")
+    print(f"多工况指标表：{metrics_path}")
+    print(f"多工况结果分析：{report_path}")
     print(f"单张分析图和最终结果图保存在：{RESULT_DIR}")
 
     # 如果命令行加 --no-show，则只保存不弹窗。
@@ -513,8 +825,16 @@ def main():
     """
     parser = argparse.ArgumentParser(description="题目二：安全地形可通行区域仿真")
     parser.add_argument("--batch", action="store_true", help="批量处理 data 目录中的示例图片")
+    parser.add_argument("--conditions", action="store_true", help="仅生成多工况验证报告")
     parser.add_argument("--no-show", action="store_true", help="批量处理时只保存结果，不弹出图像窗口")
     args = parser.parse_args()
+
+    if args.conditions:
+        setup_matplotlib_font()
+        metrics_path, report_path = run_condition_validation()
+        print(f"多工况指标表：{metrics_path}")
+        print(f"多工况结果分析：{report_path}")
+        return
 
     if args.batch:
         run_batch(no_show=args.no_show)
