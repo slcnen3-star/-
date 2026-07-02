@@ -214,6 +214,18 @@ def build_masks(bgr, hsv, gray, category):
             out[labels == i] = 255
         return out
 
+    def keep_seeded_components(mask, seed_mask, min_area=700):
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        out = np.zeros_like(mask)
+        for i in range(1, num):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < min_area:
+                continue
+            component = labels == i
+            if np.any(seed_mask[component] > 0):
+                out[component] = 255
+        return out
+
     def filter_surface_components(mask):
         num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         out = np.zeros_like(mask)
@@ -272,8 +284,7 @@ def build_masks(bgr, hsv, gray, category):
         (((s_ch < 128) & (v_ch > 50) & (v_ch < 235)) | ((h_ch >= 10) & (h_ch <= 38) & (s_ch < 160)))
         & (sky_or_glare == 0)
     ).astype(np.uint8) * 255
-    gravel_safe_surface = cv2.bitwise_and(gravel_safe_color, safe_road_corridor)
-    gravel_safe_surface = clean_mask(gravel_safe_surface, kernel_size=7, min_area=700)
+    gravel_safe_surface = clean_mask(gravel_safe_color, kernel_size=5, min_area=650)
 
     green_hsv = (
         ((h_ch >= 28) & (h_ch <= 96) & (s_ch >= 35) & (v_ch >= 35) & (v_ch <= 245))
@@ -344,6 +355,46 @@ def build_masks(bgr, hsv, gray, category):
     gravel_or_soil = clean_mask(gravel_or_soil, kernel_size=5, min_area=450)
     gravel_or_soil = filter_surface_components(gravel_or_soil)
 
+    if category == "gravel":
+        warm_gravel_surface = (
+            (
+                ((h_ch >= 5) & (h_ch <= 38) & (s_ch >= 24) & (v_ch >= 55) & (v_ch <= 245))
+                | ((r > g * 1.02) & (g >= b * 0.92) & ((r - b) > 10) & (s_ch >= 18) & (v_ch >= 58))
+            )
+            & (sky_or_glare == 0)
+            & (haze_or_uncertain == 0)
+        ).astype(np.uint8) * 255
+        reachable_surface = cv2.bitwise_and(gravel_or_soil, road_corridor)
+        road_surface_candidate = cv2.bitwise_or(warm_gravel_surface, gravel_road_prior)
+        road_surface_candidate = cv2.bitwise_or(
+            road_surface_candidate,
+            cv2.bitwise_and(gravel_safe_surface, reachable_surface),
+        )
+        road_surface_candidate = cv2.bitwise_or(road_surface_candidate, reachable_surface)
+        road_surface_candidate = cv2.bitwise_and(road_surface_candidate, cv2.bitwise_not(green_hsv))
+        road_surface_candidate = cv2.bitwise_and(road_surface_candidate, cv2.bitwise_not(sky_or_glare))
+        road_surface_candidate = cv2.bitwise_and(road_surface_candidate, cv2.bitwise_not(haze_or_uncertain))
+        road_surface_candidate = clean_mask(road_surface_candidate, kernel_size=7, min_area=900)
+
+        bottom_seed = np.zeros((h, w), dtype=np.uint8)
+        bottom_seed[int(h * 0.58):, int(w * 0.20): int(w * 0.80)] = 255
+        seeded_road = cv2.bitwise_and(road_surface_candidate, bottom_seed)
+        if np.count_nonzero(seeded_road) < int(h * w * 0.01):
+            broader_surface = cv2.bitwise_and(gravel_or_soil, safe_road_corridor)
+            road_surface_candidate = cv2.bitwise_or(road_surface_candidate, broader_surface)
+            road_surface_candidate = clean_mask(road_surface_candidate, kernel_size=7, min_area=900)
+            seeded_road = cv2.bitwise_and(road_surface_candidate, bottom_seed)
+
+        gravel_safe_surface = keep_seeded_components(road_surface_candidate, seeded_road, min_area=1100)
+        gravel_safe_surface = cv2.morphologyEx(
+            gravel_safe_surface,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19)),
+        )
+        if np.count_nonzero(gravel_safe_surface) < int(h * w * 0.025):
+            gravel_safe_surface = cv2.bitwise_and(road_surface_candidate, safe_road_corridor)
+        gravel_safe_surface = clean_mask(gravel_safe_surface, kernel_size=7, min_area=1000)
+
     grass_candidate = cv2.bitwise_or(vegetation, yellow_grass)
     grass_candidate = cv2.bitwise_and(grass_candidate, cv2.bitwise_not(gravel_or_soil))
     grass_candidate = clean_mask(grass_candidate, kernel_size=5, min_area=450)
@@ -413,6 +464,21 @@ def build_masks(bgr, hsv, gray, category):
     safe = cv2.bitwise_and(safe, cv2.bitwise_not(haze_or_uncertain))
     safe = cv2.bitwise_and(safe, visible_for_safe)
     safe = keep_accessible_safe_components(clean_mask(safe, kernel_size=7, min_area=600))
+    if category == "gravel":
+        repair_candidate = cv2.bitwise_or(road_surface_candidate, cv2.bitwise_and(gravel_or_soil, road_corridor))
+        repair_candidate = cv2.bitwise_and(repair_candidate, cv2.bitwise_not(green_hsv))
+        repair_candidate = cv2.bitwise_and(repair_candidate, cv2.bitwise_not(sky_or_glare))
+        repair_candidate = cv2.bitwise_and(repair_candidate, cv2.bitwise_not(obstacle))
+        repair_candidate = clean_mask(repair_candidate, kernel_size=5, min_area=450)
+        repaired = keep_seeded_components(repair_candidate, safe, min_area=450)
+        safe = cv2.bitwise_or(safe, repaired)
+        safe = cv2.morphologyEx(
+            safe,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23)),
+        )
+        safe = cv2.bitwise_and(safe, cv2.bitwise_not(obstacle))
+        safe = keep_accessible_safe_components(clean_mask(safe, kernel_size=5, min_area=600))
 
     caution = cv2.bitwise_and(caution_candidate, cv2.bitwise_not(safe))
     caution = cv2.bitwise_and(caution, cv2.bitwise_not(obstacle))

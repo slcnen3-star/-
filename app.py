@@ -63,16 +63,16 @@ class ImagePanel(tk.Frame):
             textvariable=self.title_var,
             bg=COLORS["panel"],
             fg=COLORS["text"],
-            font=("Microsoft YaHei", 13, "bold"),
+            font=("Microsoft YaHei", 12, "bold"),
             anchor="center",
             justify="center",
             padx=14,
-            pady=10,
+            pady=8,
         ).grid(row=0, column=0, sticky="ew")
 
         self.placeholder = placeholder
         self.canvas = tk.Canvas(self, bg=COLORS["panel_soft"], highlightthickness=0, width=440, height=330)
-        self.canvas.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.canvas.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
         self.canvas.bind("<Configure>", lambda _event: self.refresh())
 
     def set_title(self, title: str) -> None:
@@ -137,7 +137,7 @@ class TerrainApp:
         self.images = engine.collect_images()
         self.current_item: tuple[str, str, Path] | None = None
         self.analysis_cache: tuple[Path, str, object, dict[str, object], object, object] | None = None
-        self.status_var = tk.StringVar(value="请先导入图片，或从示例列表选择图片。")
+        self.status_var = tk.StringVar(value="请先导入图片。")
         self.original_panel: ImagePanel | None = None
         self.process_panel: ImagePanel | None = None
         self.last_processed_image: Image.Image | None = None
@@ -146,7 +146,6 @@ class TerrainApp:
 
         self._build_style()
         self._build_layout()
-        self._fill_image_list()
 
     def _build_style(self) -> None:
         style = ttk.Style()
@@ -173,88 +172,88 @@ class TerrainApp:
         style.map("Soft.TButton", background=[("active", "#d6e2f0")])
 
     def _build_layout(self) -> None:
-        self.root.columnconfigure(1, weight=1)
+        self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
 
-        sidebar = tk.Frame(self.root, bg=COLORS["sidebar"], width=320)
-        sidebar.grid(row=0, column=0, sticky="ns")
-        sidebar.grid_propagate(False)
-
         content = tk.Frame(self.root, bg=COLORS["bg"])
-        content.grid(row=0, column=1, sticky="nsew")
+        content.grid(row=0, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(1, weight=1)
+        content.rowconfigure(2, weight=0)
 
-        self._build_sidebar(sidebar)
         self._build_header(content)
         self._build_image_area(content)
+        self._build_bottom_controls(content)
 
-    def _build_sidebar(self, parent: tk.Frame) -> None:
-        tk.Label(
-            parent,
-            text="检测按钮",
-            bg=COLORS["sidebar"],
-            fg="#ffffff",
-            font=("Microsoft YaHei", 22, "bold"),
-            anchor="center",
-            justify="center",
-            padx=24,
-        ).pack(fill="x", pady=(28, 18))
+    def _build_bottom_controls(self, parent: tk.Frame) -> None:
+        controls = tk.Frame(parent, bg=COLORS["bg"], padx=22)
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 16))
+        controls.columnconfigure(0, weight=1)
 
-        actions = tk.Frame(parent, bg=COLORS["sidebar"], padx=22, pady=8)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="导入图片", style="Primary.TButton", command=self.import_image).pack(
-            fill="x", pady=(0, 9)
+        bar = tk.Frame(controls, bg=COLORS["bg"])
+        bar.grid(row=0, column=0)
+
+        def group(master: tk.Frame, title: str, column: int, columns: int) -> tk.Frame:
+            box = tk.Frame(
+                master,
+                bg=COLORS["panel"],
+                highlightthickness=1,
+                highlightbackground=COLORS["line"],
+                padx=10,
+                pady=8,
+            )
+            box.grid(row=0, column=column, padx=8, sticky="n")
+            tk.Label(
+                box,
+                text=title,
+                bg=COLORS["panel"],
+                fg=COLORS["muted"],
+                font=("Microsoft YaHei", 9, "bold"),
+                anchor="center",
+                justify="center",
+            ).grid(row=0, column=0, columnspan=columns, sticky="ew", pady=(0, 6))
+            for index in range(columns):
+                box.columnconfigure(index, weight=1, uniform=f"{title}_button")
+            return box
+
+        file_group = group(bar, "图像操作", 0, 1)
+        analysis_group = group(bar, "检测分析", 1, 3)
+        result_group = group(bar, "结果区域", 2, 1)
+
+        button_width = 12
+        ttk.Button(file_group, text="导入", style="Primary.TButton", width=button_width, command=self.import_image).grid(
+            row=1, column=0, sticky="ew", pady=(0, 5)
         )
-
-        for process_key, text in self.PROCESS_BUTTONS:
+        ttk.Button(file_group, text="保存", style="Soft.TButton", width=button_width, command=self.save_processed_image).grid(
+            row=2, column=0, sticky="ew", pady=(0, 5)
+        )
+        for index, (process_key, text) in enumerate(self.PROCESS_BUTTONS):
+            row, col = divmod(index, 3)
             ttk.Button(
-                actions,
+                analysis_group,
                 text=text,
                 style="Soft.TButton",
+                width=button_width,
                 command=lambda key=process_key: self.show_process_result(key),
-            ).pack(fill="x", pady=(0, 7))
+            ).grid(row=row + 1, column=col, sticky="ew", padx=4, pady=3)
 
         ttk.Button(
-            actions,
+            result_group,
             text="安全可通行区域",
             style="Soft.TButton",
+            width=button_width,
             command=lambda: self.show_process_result("safe"),
-        ).pack(fill="x", pady=(4, 7))
-        ttk.Button(actions, text="打开结果文件夹", style="Soft.TButton", command=self.open_results_folder).pack(
-            fill="x", pady=(0, 7)
-        )
-        ttk.Button(actions, text="保存", style="Soft.TButton", command=self.save_processed_image).pack(fill="x")
-
-        list_wrap = tk.Frame(parent, bg=COLORS["sidebar"], padx=22)
-        list_wrap.pack(fill="both", expand=True)
-        tk.Label(
-            list_wrap,
-            text="示例图片",
-            bg=COLORS["sidebar"],
-            fg="#ffffff",
-            font=("Microsoft YaHei", 11, "bold"),
-            anchor="center",
-            justify="center",
-        ).pack(fill="x", pady=(0, 8))
-
-        self.image_list = tk.Listbox(
-            list_wrap,
-            bg="#101a27",
-            fg="#edf4fb",
-            selectbackground=COLORS["blue"],
-            selectforeground="#ffffff",
-            activestyle="none",
-            relief="flat",
-            highlightthickness=0,
-            font=("Microsoft YaHei", 10),
-            height=8,
-        )
-        self.image_list.pack(fill="both", expand=True)
-        self.image_list.bind("<<ListboxSelect>>", lambda _event: self._on_select_image())
+        ).grid(row=1, column=0, sticky="ew", pady=(0, 5))
+        ttk.Button(
+            result_group,
+            text="打开文件夹",
+            style="Soft.TButton",
+            width=button_width,
+            command=self.open_results_folder,
+        ).grid(row=2, column=0, sticky="ew")
 
     def _build_header(self, parent: tk.Frame) -> None:
-        header = tk.Frame(parent, bg=COLORS["bg"], padx=26, pady=22)
+        header = tk.Frame(parent, bg=COLORS["bg"], padx=22, pady=12)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
 
@@ -263,37 +262,23 @@ class TerrainApp:
             text="安全地形可通行区域仿真平台",
             bg=COLORS["bg"],
             fg=COLORS["text"],
-            font=("Microsoft YaHei", 22, "bold"),
+            font=("Microsoft YaHei", 20, "bold"),
             anchor="center",
             justify="center",
         ).grid(row=0, column=0, sticky="ew")
 
     def _build_image_area(self, parent: tk.Frame) -> None:
         preview = tk.Frame(parent, bg=COLORS["bg"])
-        preview.grid(row=1, column=0, sticky="nsew", padx=22, pady=(0, 22))
+        preview.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 10))
         preview.columnconfigure(0, weight=1, uniform="image_grid")
         preview.columnconfigure(1, weight=1, uniform="image_grid")
         preview.rowconfigure(0, weight=1)
 
         self.original_panel = ImagePanel(preview, "原图", "")
-        self.original_panel.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.original_panel.grid(row=0, column=0, sticky="nsew", padx=7, pady=7)
 
         self.process_panel = ImagePanel(preview, "处理图片", "")
-        self.process_panel.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
-
-    def _fill_image_list(self) -> None:
-        self.image_list.delete(0, tk.END)
-        for _category, label, path in self.images:
-            self.image_list.insert(tk.END, f"{label} - {path.name}")
-
-    def _on_select_image(self) -> None:
-        selection = self.image_list.curselection()
-        if not selection:
-            return
-        self.current_item = self.images[selection[0]]
-        _category, label, path = self.current_item
-        self._load_current_original()
-        self.status_var.set(f"已选择：{label} / {path.name}。请点击左侧检测按钮。")
+        self.process_panel.grid(row=0, column=1, sticky="nsew", padx=7, pady=7)
 
     def import_image(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -310,9 +295,8 @@ class TerrainApp:
         category = self._guess_category(path)
         label = engine.CATEGORIES[category]
         self.current_item = (category, label, path)
-        self.image_list.selection_clear(0, tk.END)
         self._load_current_original()
-        self.status_var.set(f"已导入：{label} / {path.name}。请点击左侧检测按钮。")
+        self.status_var.set(f"已导入：{label} / {path.name}。请点击下方检测按钮。")
 
     def _guess_category(self, path: Path) -> str:
         """在 UI 不显示类别选择的情况下，内部自动估计地形类别。"""
@@ -370,7 +354,7 @@ class TerrainApp:
 
     def _require_current_item(self) -> tuple[str, str, Path] | None:
         if self.current_item is None:
-            messagebox.showinfo("提示", "请先导入图片，或从示例列表选择一张图片。")
+            messagebox.showinfo("提示", "请先导入图片。")
             return None
         return self.current_item
 
